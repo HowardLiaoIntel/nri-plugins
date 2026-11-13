@@ -373,14 +373,21 @@ func (p *plugin) startTelemetry(ctx context.Context) error {
 	}
 
 	meter := state.provider.Meter("nri-resctrl-mon")
-	reg, err := setupMetrics(p.mgr, cfg, p.config.ResctrlPath, meter)
+	reg, err := setupMetrics(p.mgr, cfg, p.config.ResctrlPath, p.config.GroupBy, meter)
 	if err != nil {
 		state.shutdown(ctx)
 		return fmt.Errorf("metrics registration: %w", err)
+	}
+	allocReg, err := registerAllocMetrics(meter, p.config.ResctrlPath)
+	if err != nil {
+		_ = reg.Unregister()
+		state.shutdown(ctx)
+		return fmt.Errorf("allocation metrics registration: %w", err)
 	}
 	// Publish only after registration succeeds; otherwise a failed setupMetrics
 	// would leave p.telemetry non-nil and a later Configure would skip startup.
 	p.telemetry = state
 	p.metrics = reg
+	p.allocMetrics = allocReg
 	return nil
 }
