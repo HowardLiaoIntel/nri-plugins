@@ -378,16 +378,9 @@ func (p *plugin) startTelemetry(ctx context.Context) error {
 		state.shutdown(ctx)
 		return fmt.Errorf("metrics registration: %w", err)
 	}
-	allocReg, err := registerAllocMetrics(meter, p.config.ResctrlPath)
-	if err != nil {
-		_ = reg.Unregister()
-		state.shutdown(ctx)
-		return fmt.Errorf("allocation metrics registration: %w", err)
-	}
 	// Publish only after registration succeeds; otherwise a failed setupMetrics
 	// would leave p.telemetry non-nil and a later Configure would skip startup.
 	p.telemetry = state
 	p.metrics = reg
-	p.allocMetrics = allocReg
 	return nil
 }

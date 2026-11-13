@@ -25,7 +25,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"sigs.k8s.io/yaml"
@@ -35,7 +34,6 @@ import (
 	"github.com/intel/goresctrl/pkg/kubernetes"
 	"github.com/intel/goresctrl/pkg/monitor"
 	"github.com/intel/goresctrl/pkg/rdt"
-	otelmetric "go.opentelemetry.io/otel/metric"
 )
 
 const (
@@ -55,15 +53,13 @@ type plugin struct {
 	// The runtime serializes NRI events, sends Synchronize before any other
 	// event, and disconnects a plugin whose handler times out (onClose exits).
 	// opMu makes that explicit and orders the background reconciler against
-	// the handlers. It guards config, mgr, runtime, pendingRemoval, sandboxes
-	// and vmPIDs.
+	// the handlers. It guards config, mgr, runtime, pendingRemoval, and sandboxes.
 	opMu           sync.Mutex
 	config         *pluginConfig
 	mgr            resctrlManager
 	runtime        string                         // runtime name reported to Configure
 	pendingRemoval map[string]bool                // keys whose Remove failed, retried by the reconciler
-	sandboxes      map[string]map[string]struct{} // canonical pod UID -> live sandbox IDs
-	vmPIDs         map[string]map[int]struct{}    // canonical key -> VM monitor process IDs whose threads are tracked
+	sandboxes      map[string]map[string]struct{} // canonical group key -> live sandbox IDs
 
 	// lifeMu guards the state onClose tears down; onClose must not wait on a
 	// stuck handler holding opMu. Lock order: opMu, then lifeMu.
@@ -71,8 +67,7 @@ type plugin struct {
 	stopReconciler chan struct{} // closed to stop the background reconciler
 	telemetry      *telemetryState
 	metrics        *monitor.Registration
-	allocMetrics   otelmetric.Registration // root CAT/MBA allocation gauges
-	configErr      error                   // set when Configure fails, so onClose exits non-zero
+	configErr      error // set when Configure fails, so onClose exits non-zero
 }
 
 // pluginConfig holds the runtime configuration for the plugin.
@@ -156,86 +151,6 @@ func (p *plugin) canonKey(key string) string {
 	return canon(key)
 }
 
-// procRoot is the host's proc filesystem; the plugin runs with hostPID.
-var procRoot = "/proc"
-
-// isVMPod reports whether the pod runs in a micro-VM (Kata Containers). For
-// such a pod the container PID that NRI reports is the VM monitor (QEMU), and
-// the guest's work runs in its vCPU threads, not in the main thread.
-func isVMPod(pod *api.PodSandbox) bool {
-	return strings.HasPrefix(strings.ToLower(pod.GetRuntimeHandler()), "kata")
-}
-
-// threadIDs lists the thread IDs of a process.
-func threadIDs(tgid int) ([]int, error) {
-	entries, err := os.ReadDir(filepath.Join(procRoot, strconv.Itoa(tgid), "task"))
-	if err != nil {
-		return nil, err
-	}
-	tids := make([]int, 0, len(entries))
-	for _, e := range entries {
-		if tid, err := strconv.Atoi(e.Name()); err == nil {
-			tids = append(tids, tid)
-		}
-	}
-	return tids, nil
-}
-
-// assignPID puts a container's process into the mon_group. Writing a PID to a
-// tasks file moves only that thread, and threads inherit the RMID only when
-// created after the move. For a micro-VM the monitor's vCPU and I/O threads
-// already exist, so every thread is moved, and the process is remembered so
-// the reconciler can pick up threads created later. The caller must hold opMu.
-func (p *plugin) assignPID(pod *api.PodSandbox, key string, pid int) error {
-	if !isVMPod(pod) {
-		return p.mgr.AssignPID(key, pid)
-	}
-	canon := p.canonKey(key)
-	if p.vmPIDs == nil {
-		p.vmPIDs = make(map[string]map[int]struct{})
-	}
-	if p.vmPIDs[canon] == nil {
-		p.vmPIDs[canon] = make(map[int]struct{})
-	}
-	p.vmPIDs[canon][pid] = struct{}{}
-	return p.assignThreads(key, pid)
-}
-
-// assignThreads moves every thread of tgid into the mon_group. Threads that
-// exit while being moved are not an error.
-func (p *plugin) assignThreads(key string, tgid int) error {
-	tids, err := threadIDs(tgid)
-	if err != nil {
-		return fmt.Errorf("failed to list threads of pid %d: %w", tgid, err)
-	}
-	var errs []error
-	for _, tid := range tids {
-		if err := p.mgr.AssignPID(key, tid); err != nil && !errors.Is(err, syscall.ESRCH) {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
-}
-
-// rescanVMs moves threads created since the last pass into their mon_group and
-// forgets monitor processes that have exited. The caller must hold opMu.
-func (p *plugin) rescanVMs() {
-	for key, pids := range p.vmPIDs {
-		for pid := range pids {
-			if _, err := os.Stat(filepath.Join(procRoot, strconv.Itoa(pid))); err != nil {
-				delete(pids, pid)
-				continue
-			}
-			if err := p.assignThreads(key, pid); err != nil {
-				log.Warnf("reconciler: failed to move threads of pid %d into %s: %v", pid, key, err)
-			}
-		}
-		if len(pids) == 0 {
-			delete(p.vmPIDs, key)
-		}
-	}
-}
-
 func newPlugin() *plugin {
 	cfg := &pluginConfig{
 		ResctrlPath: defaultResctrlPath,
@@ -300,10 +215,6 @@ func (p *plugin) onClose() {
 	if p.metrics != nil {
 		_ = p.metrics.Unregister()
 		p.metrics = nil
-	}
-	if p.allocMetrics != nil {
-		_ = p.allocMetrics.Unregister()
-		p.allocMetrics = nil
 	}
 	if p.telemetry != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), telemetryShutdownTimeout)
@@ -415,13 +326,13 @@ func (p *plugin) Synchronize(ctx context.Context, pods []*api.PodSandbox, contai
 	// so container order cannot create a duplicate under another class.
 	existing := existingGroupClasses(p.config)
 	for _, pod := range pods {
-		uid := p.canonKey(p.groupKey(pod))
-		class, ok := existing[uid]
+		canon := p.canonKey(p.groupKey(pod))
+		class, ok := existing[canon]
 		if !ok || !p.shouldMonitorPod(pod) {
 			continue
 		}
-		if _, err := mgr.EnsureGroup(uid, class); err != nil {
-			log.Warnf("Synchronize: failed to adopt mon_group %s under class %q: %v", uid, class, err)
+		if _, err := mgr.EnsureGroup(canon, class); err != nil {
+			log.Warnf("Synchronize: failed to adopt mon_group %s under class %q: %v", canon, class, err)
 		}
 	}
 	for _, ctr := range containers {
@@ -433,7 +344,7 @@ func (p *plugin) Synchronize(ctx context.Context, pods []*api.PodSandbox, contai
 		if !p.shouldMonitorPod(pod) {
 			continue
 		}
-		podUID := p.groupKey(pod)
+		key := p.groupKey(pod)
 		rdtClass, ok := groupClass(pod, ctr)
 		if !ok {
 			log.Debugf("Synchronize: not monitoring %s: its RDT class differs from the pod's", pprintCtr(pod, ctr))
@@ -447,18 +358,18 @@ func (p *plugin) Synchronize(ctx context.Context, pods []*api.PodSandbox, contai
 		// it would silently overwrite the container's own CAT/MBA allocation
 		// (e.g. an off-class sidecar). EnsureGroup reports exactly that mismatch
 		// as an error, so on any error skip the container instead of assigning.
-		grp, err := mgr.EnsureGroup(podUID, rdtClass)
+		grp, err := mgr.EnsureGroup(key, rdtClass)
 		if err != nil {
-			log.Warnf("Synchronize: not monitoring a container of pod %s: %v", podUID, err)
+			log.Warnf("Synchronize: not monitoring a container of mon_group %s: %v", key, err)
 			continue
 		}
 
 		pid := int(ctr.GetPid())
 		if pid > 0 {
-			if err := p.assignPID(pod, podUID, pid); err != nil {
-				log.Warnf("Synchronize: failed to write PID %d for pod %s: %v", pid, podUID, err)
+			if err := mgr.AssignPID(key, pid); err != nil {
+				log.Warnf("Synchronize: failed to write PID %d for mon_group %s: %v", pid, key, err)
 			} else {
-				log.Debugf("Synchronize: assigned pid %d for pod %s in %s", pid, podUID, grp.Path())
+				log.Debugf("Synchronize: assigned pid %d for mon_group %s in %s", pid, key, grp.Path())
 			}
 		}
 	}
@@ -535,7 +446,6 @@ func (p *plugin) startReconciler() {
 // would treat it as live forever; retrying Remove is what actually frees the
 // RMID once the kernel releases the directory. The caller must hold opMu.
 func (p *plugin) reconcile(mgr resctrlManager) {
-	p.rescanVMs()
 	for key := range p.pendingRemoval {
 		if _, live := p.sandboxes[p.canonKey(key)]; live {
 			delete(p.pendingRemoval, key)
@@ -562,14 +472,14 @@ func (p *plugin) reconcile(mgr resctrlManager) {
 // pod UID, or the namespace key in namespace mode), the form mgr.List()
 // reports. The caller must hold opMu.
 func (p *plugin) addSandbox(pod *api.PodSandbox) {
-	uid := p.canonKey(p.groupKey(pod))
+	canon := p.canonKey(p.groupKey(pod))
 	if p.sandboxes == nil {
 		p.sandboxes = make(map[string]map[string]struct{})
 	}
-	if p.sandboxes[uid] == nil {
-		p.sandboxes[uid] = make(map[string]struct{})
+	if p.sandboxes[canon] == nil {
+		p.sandboxes[canon] = make(map[string]struct{})
 	}
-	p.sandboxes[uid][pod.GetId()] = struct{}{}
+	p.sandboxes[canon][pod.GetId()] = struct{}{}
 }
 
 // existingGroupClasses maps each mon_group on disk whose name matches the
@@ -615,7 +525,7 @@ func (p *plugin) reconcileLiveSet(mgr resctrlManager) []string {
 func (p *plugin) PostCreateContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) error {
 	p.opMu.Lock()
 	defer p.opMu.Unlock()
-	podUID := p.groupKey(pod)
+	key := p.groupKey(pod)
 	ctrName := pprintCtr(pod, ctr)
 
 	log.Debugf("PostCreateContainer %s: pid=%d (expected 0)", ctrName, ctr.GetPid())
@@ -631,7 +541,7 @@ func (p *plugin) PostCreateContainer(ctx context.Context, pod *api.PodSandbox, c
 		log.Infof("PostCreateContainer %s: not monitored, its RDT class differs from the pod's", ctrName)
 		return nil
 	}
-	if _, err := p.mgr.EnsureGroup(podUID, rdtClass); err != nil {
+	if _, err := p.mgr.EnsureGroup(key, rdtClass); err != nil {
 		log.Warnf("PostCreateContainer %s: failed to create mon_group: %v", ctrName, err)
 		return nil // non-fatal: don't block container creation
 	}
@@ -649,7 +559,7 @@ func (p *plugin) PostCreateContainer(ctx context.Context, pod *api.PodSandbox, c
 func (p *plugin) StartContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) error {
 	p.opMu.Lock()
 	defer p.opMu.Unlock()
-	podUID := p.groupKey(pod)
+	key := p.groupKey(pod)
 	ctrName := pprintCtr(pod, ctr)
 	pid := int(ctr.GetPid())
 
@@ -670,9 +580,9 @@ func (p *plugin) StartContainer(ctx context.Context, pod *api.PodSandbox, ctr *a
 		mgr := p.mgr
 		if rdtClass, ok := groupClass(pod, ctr); !ok {
 			log.Debugf("StartContainer %s: not assigning PID %d: its RDT class differs from the pod's", ctrName, pid)
-		} else if grp, err := mgr.EnsureGroup(podUID, rdtClass); err != nil {
+		} else if grp, err := mgr.EnsureGroup(key, rdtClass); err != nil {
 			log.Warnf("StartContainer %s: not assigning PID %d: %v", ctrName, pid, err)
-		} else if err := p.assignPID(pod, podUID, pid); err != nil {
+		} else if err := mgr.AssignPID(key, pid); err != nil {
 			log.Warnf("StartContainer %s: failed to assign PID %d: %v", ctrName, pid, err)
 		} else {
 			log.Infof("StartContainer %s: assigned pid %d (pre-start, no threads yet) in %s", ctrName, pid, grp.Path())
@@ -690,7 +600,7 @@ func (p *plugin) StartContainer(ctx context.Context, pod *api.PodSandbox, ctr *a
 func (p *plugin) PostStartContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) error {
 	p.opMu.Lock()
 	defer p.opMu.Unlock()
-	podUID := p.groupKey(pod)
+	key := p.groupKey(pod)
 	ctrName := pprintCtr(pod, ctr)
 	pid := int(ctr.GetPid())
 
@@ -708,9 +618,9 @@ func (p *plugin) PostStartContainer(ctx context.Context, pod *api.PodSandbox, ct
 		mgr := p.mgr
 		if rdtClass, ok := groupClass(pod, ctr); !ok {
 			log.Debugf("PostStartContainer %s: not assigning PID %d: its RDT class differs from the pod's", ctrName, pid)
-		} else if grp, err := mgr.EnsureGroup(podUID, rdtClass); err != nil {
+		} else if grp, err := mgr.EnsureGroup(key, rdtClass); err != nil {
 			log.Warnf("PostStartContainer %s: not assigning PID %d: %v", ctrName, pid, err)
-		} else if err := p.assignPID(pod, podUID, pid); err != nil {
+		} else if err := mgr.AssignPID(key, pid); err != nil {
 			log.Warnf("PostStartContainer %s: failed to assign PID %d: %v", ctrName, pid, err)
 		} else {
 			log.Infof("PostStartContainer %s: assigned pid %d in %s", ctrName, pid, grp.Path())
@@ -748,13 +658,13 @@ func (p *plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 func (p *plugin) RemovePodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 	p.opMu.Lock()
 	defer p.opMu.Unlock()
-	podUID := p.groupKey(pod)
-	uid := p.canonKey(podUID)
+	key := p.groupKey(pod)
+	canon := p.canonKey(key)
 
-	if ids := p.sandboxes[uid]; ids != nil {
+	if ids := p.sandboxes[canon]; ids != nil {
 		delete(ids, pod.GetId())
 		if len(ids) > 0 {
-			log.Infof("RemovePodSandbox %s/%s: removed sandbox %s, keeping mon_group for the pod's live sandbox",
+			log.Infof("RemovePodSandbox %s/%s: removed sandbox %s, keeping mon_group for its live sandboxes",
 				pod.GetNamespace(), pod.GetName(), pod.GetId())
 			return nil
 		}
@@ -762,8 +672,7 @@ func (p *plugin) RemovePodSandbox(ctx context.Context, pod *api.PodSandbox) erro
 
 	// The pod is gone, so stop protecting its key in the reconciler's live set;
 	// otherwise a failed Remove below could never be reaped.
-	delete(p.sandboxes, uid)
-	delete(p.vmPIDs, uid)
+	delete(p.sandboxes, canon)
 
 	// Attempt removal unconditionally rather than gating on shouldMonitorPod: a
 	// pod may have been monitored under a configuration that was later changed to
@@ -771,7 +680,7 @@ func (p *plugin) RemovePodSandbox(ctx context.Context, pod *api.PodSandbox) erro
 	// never run and the key would linger in the Manager, so the reconciler would
 	// keep treating it as live and never reap it. Remove is idempotent and
 	// reports ErrNotTracked for a pod that was never monitored.
-	switch err := p.mgr.Remove(podUID); {
+	switch err := p.mgr.Remove(key); {
 	case err == nil:
 		log.Infof("RemovePodSandbox %s/%s: removed mon_group", pod.GetNamespace(), pod.GetName())
 	case errors.Is(err, monitor.ErrNotTracked):
@@ -779,7 +688,7 @@ func (p *plugin) RemovePodSandbox(ctx context.Context, pod *api.PodSandbox) erro
 	default:
 		log.Warnf("RemovePodSandbox %s/%s: failed to remove mon_group (will be retried by reconciler): %v",
 			pod.GetNamespace(), pod.GetName(), err)
-		p.pendingRemoval[podUID] = true
+		p.pendingRemoval[key] = true
 	}
 	return nil
 }
